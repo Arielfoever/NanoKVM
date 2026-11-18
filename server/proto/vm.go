@@ -231,6 +231,7 @@ type TerminalSessionInfo struct {
 	ClientIP  string `json:"clientIp"`
 	UserAgent string `json:"userAgent"`
 	CreatedAt int64  `json:"createdAt"` // unix milliseconds
+	Attached  bool   `json:"attached"`
 }
 
 type GetTerminalSessionsRsp struct {
