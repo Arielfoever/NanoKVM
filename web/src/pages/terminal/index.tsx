@@ -14,8 +14,8 @@ import { Head } from '@/components/head.tsx';
 import { validatePicocomParameters } from './validater.ts';
 
 const disconnectedNotificationKey = 'terminal-disconnected';
-const heartbeatDelay = 250;
-const heartbeatTimeout = 1000;
+const heartbeatDelay = 3000;
+const heartbeatTimeout = 10000;
 const heartbeatPing = JSON.stringify({ type: 'ping' });
 const heartbeatPong = '{"type":"pong"}';
 const terminalSessionIDType = 'session';
@@ -25,7 +25,7 @@ function formatLastResponseTime(timestamp: number, language: string) {
 
   if (language.toLowerCase().startsWith('zh')) {
     const pad = (value: number) => String(value).padStart(2, '0');
-    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日${pad(date.getHours())}：${pad(date.getMinutes())}：${pad(date.getSeconds())}`;
+    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
   }
 
   try {
@@ -47,13 +47,21 @@ function formatLastResponseTime(timestamp: number, language: string) {
 // used to reattach to an existing session (e.g. /#terminal?session=<id>) and the
 // serial port parameters (e.g. /#terminal?port=/dev/ttyUSB0&baud=115200) used to
 // describe a new serial session.
-const terminalQueryKeys = ['session', 'port', 'baud', 'parity', 'flowControl', 'dataBits', 'stopBits'];
+const terminalQueryKeys = [
+  'session',
+  'port',
+  'baud',
+  'parity',
+  'flowControl',
+  'dataBits',
+  'stopBits'
+];
 
 function getTerminalQuery() {
-  const urls = window.location.href.split('?');
-  if (urls.length < 2) return new URLSearchParams();
+  const queryStart = window.location.hash.indexOf('?');
+  if (queryStart < 0) return new URLSearchParams();
 
-  return new URLSearchParams(urls[1]);
+  return new URLSearchParams(window.location.hash.slice(queryStart + 1));
 }
 
 function getTerminalWsUrl() {
@@ -73,14 +81,20 @@ function getTerminalWsUrl() {
 }
 
 function rememberTerminalSession(sessionID: string) {
-  const hashRoute = window.location.hash.split('?')[0] || '#terminal';
+  updateTerminalSessionURL(sessionID);
+}
+
+function updateTerminalSessionURL(sessionID: string | null) {
+  const url = new URL(window.location.href);
+  const hashRoute = url.hash.split('?')[0] || '#terminal';
   const params = getTerminalQuery();
-  params.set('session', sessionID);
-  window.history.replaceState(
-    window.history.state,
-    '',
-    `${window.location.pathname}${window.location.search}${hashRoute}?${params.toString()}`
-  );
+  if (sessionID) {
+    params.set('session', sessionID);
+  } else {
+    params.delete('session');
+  }
+  url.hash = params.size > 0 ? `${hashRoute}?${params.toString()}` : hashRoute;
+  window.history.replaceState(window.history.state, '', url.toString());
 }
 
 // The backend uses these application-defined close codes when another page
@@ -89,6 +103,7 @@ function rememberTerminalSession(sessionID: string) {
 const terminalTakenOverCode = 4409;
 const terminalClosedCode = 4410;
 const terminalSessionEndedCode = 4411;
+const terminalSessionLimitCode = 4412;
 const terminalAppCloseCodeMin = 4000;
 const terminalAppCloseCodeMax = 4999;
 
@@ -98,12 +113,19 @@ export const Terminal = () => {
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [isDisconnected, setIsDisconnected] = useState(false);
   const [closedReason, setClosedReason] = useState<
-    'unavailable' | 'takenOver' | 'closed' | 'ended' | 'remoteClosed' | null
+    'unavailable' | 'takenOver' | 'closed' | 'ended' | 'remoteClosed' | 'limit' | null
   >(null);
   const lastResponseAtRef = useRef(Date.now());
   const disconnectedTimerRef = useRef<number | undefined>(undefined);
   const language = i18n.resolvedLanguage || i18n.language;
   const [sessionID, setSessionID] = useState(() => getTerminalQuery().get('session'));
+  const sessionIDRef = useRef(sessionID);
+
+  const clearTerminalSession = useCallback(() => {
+    sessionIDRef.current = null;
+    setSessionID(null);
+    updateTerminalSessionURL(null);
+  }, []);
 
   const stopDisconnectedTimer = useCallback(() => {
     if (disconnectedTimerRef.current !== undefined) {
@@ -151,6 +173,13 @@ export const Terminal = () => {
     lastResponseAtRef.current = Date.now();
 
     ws.addEventListener('close', (event) => {
+      if (isDisposed) return;
+
+      if (event.code === terminalSessionLimitCode) {
+        setClosedReason('limit');
+        return;
+      }
+
       if (!hasOpened) {
         setClosedReason('unavailable');
         return;
@@ -163,11 +192,13 @@ export const Terminal = () => {
 
       if (event.code === terminalClosedCode) {
         setClosedReason('closed');
+        clearTerminalSession();
         return;
       }
 
       if (event.code === terminalSessionEndedCode) {
         setClosedReason('ended');
+        clearTerminalSession();
         return;
       }
 
@@ -274,7 +305,8 @@ export const Terminal = () => {
     };
 
     const exitPicocom = () => {
-      if (ws.readyState === WebSocket.OPEN && isPicocomRunning) {
+      // The PTY outlives this page so a reconnect can resume its serial console.
+      if (ws.readyState === WebSocket.OPEN && isPicocomRunning && !sessionIDRef.current) {
         ws.send('\x01\x18');
         isPicocomRunning = false;
       }
@@ -316,7 +348,6 @@ export const Terminal = () => {
       if (event.data === heartbeatPong) {
         event.stopImmediatePropagation();
       }
-      if (isDisposed || hasDisconnected) return;
 
       if (typeof event.data === 'string') {
         try {
@@ -326,9 +357,12 @@ export const Terminal = () => {
             typeof message.sessionId === 'string' &&
             message.sessionId.length > 0
           ) {
-            rememberTerminalSession(message.sessionId);
-            setSessionID(message.sessionId);
             event.stopImmediatePropagation();
+            if (isDisposed) return;
+            rememberTerminalSession(message.sessionId);
+            sessionIDRef.current = message.sessionId;
+            setSessionID(message.sessionId);
+            lastResponseAtRef.current = Date.now();
             return;
           }
         } catch {
@@ -336,12 +370,15 @@ export const Terminal = () => {
         }
       }
 
-      lastResponseAtRef.current = Date.now();
-      if (event.data !== heartbeatPong) return;
+      if (isDisposed || hasDisconnected) return;
 
+      lastResponseAtRef.current = Date.now();
       if (heartbeatResponseTimer !== undefined) {
         window.clearTimeout(heartbeatResponseTimer);
         heartbeatResponseTimer = undefined;
+      }
+      if (heartbeatTimer !== undefined) {
+        window.clearTimeout(heartbeatTimer);
       }
       heartbeatTimer = window.setTimeout(sendHeartbeat, heartbeatDelay);
     };
@@ -398,7 +435,7 @@ export const Terminal = () => {
       window.removeEventListener('resize', resizeScreen, false);
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
-  }, [connectionAttempt, language, notify, stopDisconnectedTimer, t]);
+  }, [clearTerminalSession, connectionAttempt, language, notify, stopDisconnectedTimer, t]);
 
   function openNewTerminal() {
     window.open('/#terminal', '_blank');
@@ -415,6 +452,7 @@ export const Terminal = () => {
   if (closedReason === 'takenOver') {
     closedTitle = t('terminal.takenOver');
     closedHint = t('terminal.takenOverHint');
+    // Keep the id so the user can explicitly retake the still-live session.
     canReconnect = Boolean(sessionID);
   } else if (closedReason === 'closed') {
     closedTitle = t('terminal.closedRemotely');
@@ -426,6 +464,9 @@ export const Terminal = () => {
     closedTitle = t('terminal.remoteClosed');
     closedHint = t('terminal.remoteClosedHint');
     canReconnect = Boolean(sessionID);
+  } else if (closedReason === 'limit') {
+    closedTitle = t('terminal.sessionLimit');
+    closedHint = t('terminal.sessionLimitHint');
   }
 
   return (
@@ -465,11 +506,9 @@ export const Terminal = () => {
             <div className="flex max-w-[420px] flex-col items-center gap-3 rounded-lg bg-neutral-900/90 px-8 py-6 text-center">
               <div className="text-lg font-medium text-white">{closedTitle}</div>
 
-              {closedHint && (
-                <div className="text-sm text-neutral-400">{closedHint}</div>
-              )}
+              {closedHint && <div className="text-sm text-neutral-400">{closedHint}</div>}
 
-              {canReconnect ? (
+              {closedReason === 'limit' ? null : canReconnect ? (
                 <Button type="primary" onClick={reconnectSession}>
                   {t('terminal.reconnect')}
                 </Button>
